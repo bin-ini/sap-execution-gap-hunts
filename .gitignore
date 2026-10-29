@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Notebook outputs land here
+results/*.csv
+results/*.json
+
+# MSTICpy / secrets — never commit these
+msticpyconfig.yaml
+.msticpy/
+*.key
+*.pem
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
+*.log

@@ -1,0 +1,8 @@
+# Notebook runtime for SAP_Execution_Chain_Hunter.ipynb
+msticpy[azsentinel]>=2.9
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
+networkx>=3.0
+# jupytext is optional: convert the .py percent-format export back to .ipynb
+jupytext>=1.16
