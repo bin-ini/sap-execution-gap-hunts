@@ -1,0 +1,112 @@
+// =====================================================================
+// Hunt ID   : EG05
+// Title     : SAP low-and-slow execution chain (explainable SequenceRisk)
+// Theme     : Execution gap - multi-stage attack reconstruction
+// -----------------------------------------------------------------------
+// Hypothesis: A capable attacker spreads steps over hours/days so no single
+//             event trips a threshold: unusual logon -> privilege change ->
+//             sensitive action -> SAP-host process anomaly -> first-seen
+//             destination. Scored together, the chain stands out even when
+//             each link is quiet.
+// MITRE      : chains TA0001/TA0004/TA0002/TA0011 - see component hunts.
+// -----------------------------------------------------------------------
+// WHY THIS IS NOT THE OOB / CONTENT HUB CONTENT:
+//   The dynamic anomaly rules score SAP audit events in isolation. This stitches
+//   SAP identity/privilege/action stages to Defender host-process and network
+//   stages per identity and computes an EXPLAINABLE risk (every term is
+//   attributable), rather than a single-source anomaly verdict.
+// -----------------------------------------------------------------------
+// IMPORTANT: this KQL is the triage-grade assembler. Stages D (host process)
+//   and E (first-seen destination) are tied to an identity via the SAP hosts
+//   that identity was active on in the window - a coarse host-level attribution
+//   that can over-credit shared hosts. The companion notebook
+//   (SAP_Execution_Chain_Hunter.ipynb) does the rigorous per-user rarity and
+//   per-event temporal attribution. Treat high SequenceRisk rows as leads.
+// DATA / PREREQS: SAPAuditLog(+ABAPAuditLog), ABAPChangeDocsLog, and MDE
+//   DeviceProcessEvents/DeviceNetworkEvents on SAP hosts. Host-join caveat as EG01.
+// Tuning     : baseline/detect; stage definitions and weights; StageCount floor.
+// =====================================================================
+let baseline = 30d;
+let detect   = 3d;
+let sens_tcodes = toscalar(_GetWatchlist("SAP - Sensitive Transactions")
+                           | summarize make_set(column_ifexists("TransactionCode","")));
+// SAP host -> users active there in the detect window (for host-level D/E attribution)
+let hostUser =
+    ABAPAuditLog
+    | where TimeGenerated > ago(detect)
+    | extend SapHost = tolower(tostring(coalesce(column_ifexists("Host",""),
+                                                 column_ifexists("Computer",""),
+                                                 tostring(split(column_ifexists("Instance",""), "*")[0]))))
+    | where isnotempty(SapHost)
+    | distinct SapHost, User;
+// Stage A - rare logon (first-seen source IP for the user vs baseline)
+let histSrc =
+    SAPAuditLog
+    | where TimeGenerated between (ago(baseline + detect) .. ago(detect))
+    | where MessageID in ("AU1","AU5")
+    | summarize by User, Src = tostring(column_ifexists("TerminalIPv6", column_ifexists("SalIpAddress","")));
+let A =
+    SAPAuditLog
+    | where TimeGenerated > ago(detect)
+    | where MessageID in ("AU1","AU5")
+    | extend Src = tostring(column_ifexists("TerminalIPv6", column_ifexists("SalIpAddress","")))
+    | join kind=leftanti histSrc on User, Src
+    | summarize StageTime = min(TimeGenerated), Detail = strcat("new source ", take_any(Src)) by User
+    | extend Stage = "A_RareLogon", Score = 2.0;
+// Stage B - privilege change affecting a user (change documents)
+let B =
+    ABAPChangeDocsLog
+    | where TimeGenerated > ago(detect)
+    | where ObjectClass in ("IDENTITY","USER","PFCG")
+         or TableName in ("AGR_USERS","UST04","USR04","AGR_1251")
+    | extend User = tostring(column_ifexists("ObjectId",""))
+    | where isnotempty(User)
+    | summarize StageTime = min(TimeGenerated), Detail = strcat(count(), " privilege change-docs") by User
+    | extend Stage = "B_PrivChange", Score = 3.0;
+// Stage C - sensitive / powerful SAP action
+let C =
+    SAPAuditLog
+    | where TimeGenerated > ago(detect)
+    | where MessageID in ("CUL","BUZ","CU_M","CUN","CUO","CUP")
+         or TransactionCode in (sens_tcodes)
+         or TransactionCode in ("SE16","SE16N","SM59","SE37","SA38","SE38","SU01","PFCG")
+    | summarize StageTime = min(TimeGenerated),
+                Detail = strcat("actions: ", strcat_array(make_set(TransactionCode, 10), ",")) by User
+    | extend Stage = "C_SensitiveAction", Score = 2.0;
+// Stage D - SAP-host unexpected process (host-level), attributed to users on that host
+let Dhost =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(detect)
+    | extend DevHost = tolower(tostring(split(DeviceName, ".")[0]))
+    | where tolower(InitiatingProcessFileName) has_any ("disp+work","sapstartsrv","gwrd","icman","sapxpg")
+    | where FileName has_any ("powershell","cmd.exe","bash","sh","curl","wget","python","perl","nc","ncat","certutil")
+    | summarize StageTime = min(TimeGenerated),
+                Detail = strcat("host proc: ", strcat_array(make_set(FileName, 8), ",")) by SapHost = DevHost;
+let D = Dhost | join kind=inner hostUser on SapHost
+    | summarize StageTime = min(StageTime), Detail = take_any(Detail) by User
+    | extend Stage = "D_HostProcess", Score = 3.0;
+// Stage E - first-seen external destination from a SAP host (host-level)
+let Ehost =
+    DeviceNetworkEvents
+    | where TimeGenerated > ago(detect)
+    | where ActionType has "Connection"
+    | extend DevHost = tolower(tostring(split(DeviceName, ".")[0]))
+    | where isnotempty(RemoteIP) and not(ipv4_is_private(RemoteIP)) and not(RemoteIP startswith "127.")
+    | summarize StageTime = min(TimeGenerated),
+                Detail = strcat("dest: ", strcat_array(make_set(tolower(coalesce(RemoteUrl, RemoteIP)), 8), ",")) by SapHost = DevHost;
+let E = Ehost | join kind=inner hostUser on SapHost
+    | summarize StageTime = min(StageTime), Detail = take_any(Detail) by User
+    | extend Stage = "E_FirstSeenDest", Score = 3.0;
+union A, B, C, D, E
+| summarize Stages = make_set(Stage),
+            StageDetails = make_list(strcat(Stage, " @ ", format_datetime(StageTime, "yyyy-MM-dd HH:mm"), " - ", Detail)),
+            FirstStage = min(StageTime), LastStage = max(StageTime),
+            BaseScore = sum(Score), StageCount = dcount(Stage)
+    by User
+| where StageCount >= 3                                     // require a chain of >= 3 distinct stages
+| extend SpanHours = round(datetime_diff('minute', LastStage, FirstStage) / 60.0, 1)
+| extend TemporalCompression = round(1.0 / (1.0 + SpanHours), 3)       // tighter in time => higher
+| extend SequenceRisk = round(BaseScore * (1 + TemporalCompression) * (todouble(StageCount) / 5.0), 2)
+| project User, StageCount, Stages, SequenceRisk, BaseScore, TemporalCompression, SpanHours,
+          FirstStage, LastStage, StageDetails
+| sort by SequenceRisk desc

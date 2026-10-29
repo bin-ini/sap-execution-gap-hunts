@@ -1,0 +1,75 @@
+// =====================================================================
+// Hunt ID   : EG02
+// Title     : SAP business action -> first-seen outbound destination from the SAP host
+// Theme     : Execution gap (business intent vs infrastructure execution)
+// -----------------------------------------------------------------------
+// Hypothesis: A SAP host reaches an external network destination that has never
+//             previously been associated with that host's workload, shortly
+//             after SAP activity. The signal is not "SAP talked to the
+//             internet" - it is "this workload produced a destination it has
+//             never produced before".
+// MITRE      : TA0011 C2 / T1071; TA0010 Exfiltration / T1041.
+// -----------------------------------------------------------------------
+// WHY THIS IS NOT THE OOB / CONTENT HUB CONTENT:
+//   OOB "FTP for non authorized servers" and the data-exfiltration rules watch
+//   SAP-reported actions. This crosses into Defender DeviceNetworkEvents and
+//   baselines each SAP host's own destination history - a per-workload
+//   first-seen model the SAP-only content does not build.
+// -----------------------------------------------------------------------
+// DATA / PREREQS:
+//   - ABAPAuditLog (native) / ABAPAuditLog_CL (legacy) for SAP hosts + context.
+//   - Microsoft Defender for Endpoint on SAP application servers
+//     (DeviceNetworkEvents).
+//   - Same host-join caveat as EG01: short-hostname match here; prefer a
+//     maintained "SAP - Host Map" watchlist in production.
+//   - Internal landscape traffic is excluded via RFC1918/loopback; add your
+//     own CIDRs or the "SAP - Networks" watchlist for datacentre ranges.
+// Tuning     : baseline/detect windows; the 15-minute SAP->network window;
+//              internal-range exclusions.
+// FP notes    : New interfaces, patch/download sources, license checks, cloud
+//               connector endpoints. Baseline absorbs steady state.
+// Triage      : Is the destination known good? Which process opened it, under
+//               which OS account, after which SAP action/actor?
+// =====================================================================
+let baseline = 30d;
+let detect   = 1d;
+let corrWindow = 15m;
+let sapHostMap =
+    ABAPAuditLog
+    | where TimeGenerated > ago(baseline + detect)
+    | extend SapHost = tolower(tostring(coalesce(column_ifexists("Host",""),
+                                                 column_ifexists("Computer",""),
+                                                 tostring(split(column_ifexists("Instance",""), "*")[0]))))
+    | where isnotempty(SapHost)
+    | distinct SapHost;
+let baseDest =
+    DeviceNetworkEvents
+    | where TimeGenerated between (ago(baseline + detect) .. ago(detect))
+    | extend DevHost = tolower(tostring(split(DeviceName, ".")[0]))
+    | where DevHost in (sapHostMap)
+    | summarize by DevHost, Dest = tolower(coalesce(RemoteUrl, RemoteIP));
+let sapContext =
+    ABAPAuditLog
+    | where TimeGenerated > ago(detect)
+    | extend DevHost = tolower(tostring(coalesce(column_ifexists("Host",""),
+                                                 column_ifexists("Computer",""),
+                                                 tostring(split(column_ifexists("Instance",""), "*")[0]))))
+    | project SapTime = TimeGenerated, DevHost, SapUser = User,
+              SapTcode = TransactionCode, SapMsg = MessageId;
+DeviceNetworkEvents
+| where TimeGenerated > ago(detect)
+| where ActionType has "Connection"
+| extend DevHost = tolower(tostring(split(DeviceName, ".")[0]))
+| where DevHost in (sapHostMap)
+| where isnotempty(RemoteIP) and not(ipv4_is_private(RemoteIP))
+      and not(RemoteIP startswith "127.") and RemoteIP != "::1" and not(RemoteIP startswith "fe80")
+| extend Dest = tolower(coalesce(RemoteUrl, RemoteIP))
+| join kind=leftanti baseDest on DevHost, Dest          // destination never seen from this SAP host before
+| project NetTime = TimeGenerated, DeviceName, DevHost, InitiatingProcessFileName,
+          InitiatingProcessAccountName, RemoteIP, RemotePort, RemoteUrl, InitiatingProcessCommandLine
+| join kind=leftouter sapContext on DevHost
+| where isnull(SapTime) or (SapTime between ((NetTime - corrWindow) .. NetTime))
+| summarize arg_max(SapTime, SapUser, SapTcode, SapMsg)
+    by NetTime, DeviceName, DevHost, InitiatingProcessFileName, InitiatingProcessAccountName,
+       RemoteIP, RemotePort, RemoteUrl, InitiatingProcessCommandLine
+| sort by NetTime desc

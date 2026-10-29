@@ -1,0 +1,74 @@
+// =====================================================================
+// Hunt ID   : EG03
+// Title     : SAP actor vs OS identity divergence on the SAP host
+// Theme     : Execution gap (business intent vs infrastructure execution)
+// -----------------------------------------------------------------------
+// Hypothesis: SAP work processes run under a known service principal
+//             (<sid>adm / SAPService<SID>). When powerful OS activity on a SAP
+//             host runs under an UNEXPECTED OS account - a human/admin identity
+//             or anything outside the sanctioned service set - around the time
+//             of SAP admin actions, the technical execution context does not
+//             match the business context.
+// MITRE      : TA0004/TA0005 - T1078 Valid Accounts; T1134 Access Token Manip.
+// -----------------------------------------------------------------------
+// HONEST MODEL (read this): SAP never passes the SAP *dialog* user down to the
+//   OS; everything executes as the SAP service account. So this hunt does NOT
+//   claim a literal SAP-user -> OS-user mapping. It reasons about EXPECTED vs
+//   UNEXPECTED OS principals performing powerful actions on SAP hosts, anchored
+//   in time to SAP admin/privileged events. It surfaces candidates for review,
+//   not proof of takeover.
+// -----------------------------------------------------------------------
+// WHY THIS IS NOT THE OOB / CONTENT HUB CONTENT:
+//   No shipped SAP rule evaluates the OS principal of host activity against the
+//   sanctioned SAP service accounts, correlated to SAP privileged events. This
+//   is a cross-telemetry identity-context check.
+// -----------------------------------------------------------------------
+// DATA / PREREQS: ABAPAuditLog (+ _CL) and DeviceProcessEvents (MDE on SAP app
+//   servers). Maintain "SAP - Host Service Accounts" to list the exact
+//   sanctioned principals per host; the regex below is a portable default.
+// Tuning     : expectedPattern (sanctioned principals); the SAP anchor events;
+//              +/-30 min correlation window.
+// FP notes    : Legitimate BASIS admins operating under personal OS accounts;
+//               patching; agent service accounts. Encode those in the watchlist.
+// Triage      : Who is the OS account? Is it supposed to touch the SAP host?
+//               What SAP admin action happened in the same window, by whom?
+// =====================================================================
+let detect = 7d;
+let corrWindow = 30m;
+// Sanctioned OS principals that may legitimately run work on a SAP host.
+// Replace with a watchlist lookup ("SAP - Host Service Accounts") where possible.
+let expectedPattern = @"(?i)(adm$|^sapservice|^sapadm|^daaadm|^sdb|^sqd|nt authority|^system$|^root$|^local service|^network service|^dwadm)";
+let sapHostMap =
+    ABAPAuditLog
+    | where TimeGenerated > ago(detect)
+    | extend SapHost = tolower(tostring(coalesce(column_ifexists("Host",""),
+                                                 column_ifexists("Computer",""),
+                                                 tostring(split(column_ifexists("Instance",""), "*")[0]))))
+    | where isnotempty(SapHost)
+    | distinct SapHost;
+let sapAdmin =
+    ABAPAuditLog
+    | where TimeGenerated > ago(detect)
+    | where MessageId in ("AU7","AUD","AUE","CUL","BUZ","AU5")
+         or TransactionCode in ("SU01","PFCG","SM59","SM49","SM69","STMS","SE06","RZ10","RZ11","SE16N")
+    | extend DevHost = tolower(tostring(coalesce(column_ifexists("Host",""),
+                                                 column_ifexists("Computer",""),
+                                                 tostring(split(column_ifexists("Instance",""), "*")[0]))))
+    | project SapTime = TimeGenerated, DevHost, SapUser = User, SapTcode = TransactionCode, SapMsg = MessageId;
+DeviceProcessEvents
+| where TimeGenerated > ago(detect)
+| extend DevHost = tolower(tostring(split(DeviceName, ".")[0]))
+| where DevHost in (sapHostMap)
+| extend Acct = tolower(tostring(AccountName))
+| where isnotempty(Acct) and not(Acct matches regex expectedPattern)      // OS principal outside sanctioned set
+| where FileName has_any ("powershell","cmd.exe","bash","sh","curl","wget","python","perl",
+                          "nc","ncat","scp","ssh","net.exe","whoami","reg.exe","certutil")
+     or tolower(InitiatingProcessFileName) has_any ("disp+work","sapstartsrv","gwrd","icman","sapxpg")
+| project ProcTime = TimeGenerated, DeviceName, DevHost, Acct, FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessAccountName
+| join kind=leftouter sapAdmin on DevHost
+| where isnull(SapTime) or (SapTime between ((ProcTime - corrWindow) .. (ProcTime + corrWindow)))
+| summarize arg_max(SapTime, SapUser, SapTcode, SapMsg)
+    by ProcTime, DeviceName, DevHost, Acct, FileName, ProcessCommandLine,
+       InitiatingProcessFileName, InitiatingProcessAccountName
+| sort by ProcTime desc

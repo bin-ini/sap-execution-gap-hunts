@@ -1,0 +1,90 @@
+// =====================================================================
+// Hunt ID   : EG01
+// Title     : SAP activity -> unexpected OS child process on the SAP host
+// Theme     : Execution gap (SAP business intent vs infrastructure execution)
+// -----------------------------------------------------------------------
+// Hypothesis: A SAP application-server process (disp+work, sapstartsrv, gwrd,
+//             icman, sapxpg, ...) spawns a child process that has never been
+//             seen for that parent on that host. Shells, interpreters and
+//             network tools born from the SAP process tree are a strong sign
+//             that a business action has been turned into OS-level execution.
+//             We baseline the host's own lineage instead of hard-coding "bad".
+// MITRE      : TA0002 Execution / T1059; T1059.004 (Unix shell); T1203.
+// -----------------------------------------------------------------------
+// WHY THIS IS NOT THE OOB / CONTENT HUB CONTENT:
+//   The shipped SAP solution reasons over SAP audit telemetry (ABAPAuditLog
+//   etc.). This hunt crosses into Microsoft Defender for Endpoint
+//   (DeviceProcessEvents) and detects *first-seen process lineage under SAP
+//   parents on SAP hosts* - the boundary layer the SAP-only rules don't see.
+// -----------------------------------------------------------------------
+// DATA / PREREQS:
+//   - ABAPAuditLog (native) or ABAPAuditLog_CL (legacy) to enumerate SAP hosts
+//     and give business context.
+//   - Microsoft Defender for Endpoint deployed on the SAP *application servers*
+//     (DeviceProcessEvents via the MS Defender XDR connector).
+//   - HOST JOIN IS THE HARD PART: SAP Host/Computer/Instance must resolve to
+//     the Defender DeviceName. This query matches on the short hostname
+//     (lower-cased, first DNS label). If that is unreliable in your estate,
+//     maintain a watchlist "SAP - Host Map" (SystemID, SapHost, DeviceName)
+//     and join on it instead - strongly recommended for production use.
+//   - Correlation is TEMPORAL + SAME-HOST, not a shared transaction ID: SAP
+//     SAL and MDE share no correlation key, so we tie a process to the nearest
+//     preceding SAP action on the same host within a window.
+// Tuning     : baseline/detect windows; sapParents list; SuspScore keywords;
+//              the 10-minute SAP->process correlation window.
+// FP notes    : Legitimate external commands (SAPXPG/sm49/sm69 operations),
+//               backup agents, monitoring. Baseline absorbs the steady state;
+//               exclude known admin jobs.
+// Triage      : Inspect ProcessCommandLine + the SAP actor/tcode that preceded
+//               it. Pivot the host in EG02 (did a new destination follow?).
+// =====================================================================
+let baseline = 30d;
+let detect   = 1d;
+let corrWindow = 10m;         // SAP action must precede the process within this window
+let sapParents = dynamic(["disp+work","disp+work.exe","sapstartsrv","sapstartsrv.exe",
+                          "igswd","igswd_mt","gwrd","icman","sapwebdisp","msg_server",
+                          "enserver","enrepserver","jstart","jlaunch","sapxpg","r3trans",
+                          "tp","sapcontrol","hdbindexserver","hdbnameserver"]);
+let sapHostMap =
+    ABAPAuditLog
+    | where TimeGenerated > ago(baseline + detect)
+    | extend SapHost = tolower(tostring(coalesce(column_ifexists("Host",""),
+                                                 column_ifexists("Computer",""),
+                                                 tostring(split(column_ifexists("Instance",""), "*")[0]))))
+    | where isnotempty(SapHost)
+    | distinct SapHost;
+let baselineProc =
+    DeviceProcessEvents
+    | where TimeGenerated between (ago(baseline + detect) .. ago(detect))
+    | extend DevHost = tolower(tostring(split(DeviceName, ".")[0]))
+    | where DevHost in (sapHostMap)
+    | where tolower(InitiatingProcessFileName) in (sapParents)
+    | summarize by DevHost, Parent = tolower(InitiatingProcessFileName), Child = tolower(FileName);
+let sapContext =
+    ABAPAuditLog
+    | where TimeGenerated > ago(detect)
+    | extend DevHost = tolower(tostring(coalesce(column_ifexists("Host",""),
+                                                 column_ifexists("Computer",""),
+                                                 tostring(split(column_ifexists("Instance",""), "*")[0]))))
+    | project SapTime = TimeGenerated, DevHost, SapUser = User,
+              SapTcode = TransactionCode, SapMsg = MessageId;
+DeviceProcessEvents
+| where TimeGenerated > ago(detect)
+| extend DevHost = tolower(tostring(split(DeviceName, ".")[0]))
+| where DevHost in (sapHostMap)
+| where tolower(InitiatingProcessFileName) in (sapParents)
+| extend Parent = tolower(InitiatingProcessFileName), Child = tolower(FileName)
+| join kind=leftanti baselineProc on DevHost, Parent, Child    // first-seen child lineage on this host
+| extend SuspScore = case(
+        Child has_any ("powershell","cmd.exe","/bin/sh","bash"," sh","curl","wget","nc","ncat",
+                       "python","perl","certutil","bitsadmin","scp","ssh"), 3,
+        Child has_any ("net.exe","net1.exe","whoami","reg.exe","rundll32","mshta","wscript","cscript"), 2,
+        1)
+| project ProcTime = TimeGenerated, DeviceName, DevHost, AccountName, Parent, Child,
+          ProcessCommandLine, InitiatingProcessCommandLine, SuspScore
+| join kind=leftouter sapContext on DevHost
+| where isnull(SapTime) or (SapTime between ((ProcTime - corrWindow) .. ProcTime))
+| summarize arg_max(SapTime, SapUser, SapTcode, SapMsg)
+    by ProcTime, DeviceName, DevHost, AccountName, Parent, Child,
+       ProcessCommandLine, InitiatingProcessCommandLine, SuspScore
+| sort by SuspScore desc, ProcTime desc

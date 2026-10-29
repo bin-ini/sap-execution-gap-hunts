@@ -1,0 +1,63 @@
+// =====================================================================
+// Hunt ID   : EG04
+// Title     : SAP landscape traversal anomaly (tier-crossing by one identity)
+// Theme     : Execution gap / lateral movement across the SAP landscape
+// -----------------------------------------------------------------------
+// Hypothesis: Normal SAP use keeps an identity within an expected tier flow
+//             (DEV -> QA -> PROD, promotions move via transport, not people).
+//             An identity that logs on across tiers in a tight window -
+//             especially lower tier -> Production, or PROD -> DEV -> PROD -
+//             may be pivoting through trust relationships in the landscape.
+// MITRE      : TA0008 Lateral Movement / T1021; T1199 Trusted Relationship.
+// -----------------------------------------------------------------------
+// WHY THIS IS NOT THE OOB / CONTENT HUB CONTENT:
+//   The shipped content evaluates single events and single-system properties
+//   (unexpected network, dynamic RFC, sensitive access). This hunt models an
+//   identity's SEQUENCE of systems, classified by the SAP - Systems watchlist
+//   role (Sandbox/Development/Training/QA/Production), and flags tier-crossing
+//   transitions - landscape-level sequence logic the OOB set does not express.
+// -----------------------------------------------------------------------
+// DATA      : SAPAuditLog (function; portable) + SAPSystems() watchlist
+//             function (SystemID -> SystemRole). Pure SAP telemetry - no
+//             Defender dependency - so this one runs even without MDE on hosts.
+// Tuning    : windowMax (transitions linked within this gap); the role ranks;
+//             which transitions you consider anomalous.
+// FP notes   : Developers/BASIS with legitimate cross-tier duties; solution
+//              managers; transport operators. Exclude via SAPUsersGetVIP() or a
+//              dedicated cross-tier-allowed tag.
+// Triage     : Same source IP across tiers? RFC vs Dialog? What did the
+//              identity do on the Production system after arriving?
+// =====================================================================
+let detect = 7d;
+let windowMax = 2h;                 // consecutive logons within this gap are treated as one traversal
+let excludeVIP = SAPUsersGetVIP() | summarize by User = SAPUser;
+let sys = SAPSystems() | project SystemID, SystemRole;
+let logons =
+    SAPAuditLog
+    | where TimeGenerated > ago(detect)
+    | where MessageID in ("AU1","AU5")                   // dialog + RFC logons
+    | extend Src = tostring(column_ifexists("TerminalIPv6", column_ifexists("SalIpAddress","")))
+    | extend LogonKind = iff(MessageID == "AU5", "RFC", "Dialog")
+    | project TimeGenerated, User, SystemID, Src, LogonKind
+    | join kind=leftouter sys on SystemID
+    | extend SystemRole = tostring(coalesce(SystemRole, "Unknown"));
+logons
+| join kind=leftanti excludeVIP on User
+| order by User asc, TimeGenerated asc
+| extend PrevUser = prev(User), PrevSys = prev(SystemID), PrevRole = prev(SystemRole),
+         PrevTime = prev(TimeGenerated), PrevSrc = prev(Src)
+| where User == PrevUser and SystemID != PrevSys
+| extend GapMin = datetime_diff('minute', TimeGenerated, PrevTime)
+| where GapMin >= 0 and GapMin <= toint(windowMax / 1m)
+| extend RoleRank = dynamic({"Sandbox":1,"Development":2,"Training":2,"Quality Assurance":3,"QA":3,"Production":4})
+| extend FromRank = toint(RoleRank[PrevRole]), ToRank = toint(RoleRank[SystemRole])
+| extend Anomaly = case(
+        PrevRole != "Production" and SystemRole == "Production",                      "LowerTier->Production",
+        PrevRole == "Production" and SystemRole in ("Development","Sandbox","Training"), "Production->Lower (pivot staging)",
+        isnotnull(FromRank) and isnotnull(ToRank) and abs(ToRank - FromRank) >= 2,     "Multi-tier jump",
+        "")
+| where isnotempty(Anomaly)
+| project TimeGenerated, User, FromSystem = PrevSys, FromRole = PrevRole,
+          ToSystem = SystemID, ToRole = SystemRole, LogonKind, GapMin,
+          SrcChanged = iff(Src != PrevSrc, "yes", "no"), Src, PrevSrc, Anomaly
+| sort by TimeGenerated desc
